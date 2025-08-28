@@ -19,7 +19,6 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class BitrixConfig:
-    """Конфигурация подключения к Bitrix"""
     mysql_host: str
     mysql_port: int
     mysql_database: str
@@ -62,6 +61,14 @@ class BitrixClient:
     def __init__(self, config: BitrixConfig):
         self.config = config
         self.connection = None
+        self.logger = logging.getLogger(__name__)
+        
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
+            self.logger.setLevel(logging.INFO)
     
     def connect(self):
         """Подключение к MySQL Bitrix"""
@@ -135,27 +142,20 @@ class BitrixClient:
         query = """
         SELECT 
             e.ID,
-            e.NAME,
-            p.VALUE as ARTICLE,
-            e.IBLOCK_SECTION_ID as SECTION_ID,
-            e.ACTIVE
+            p_name.VALUE as NAME,
+            p_article.VALUE as ARTICLE
         FROM b_iblock_element e
-        LEFT JOIN b_iblock_element_property p ON (
-            e.ID = p.IBLOCK_ELEMENT_ID 
-            AND p.IBLOCK_PROPERTY_ID = (
-                SELECT ID FROM b_iblock_property 
-                WHERE IBLOCK_ID = %s AND CODE = %s
-            )
-        )
+        LEFT JOIN b_iblock_element_property p_name ON 
+            e.ID = p_name.IBLOCK_ELEMENT_ID AND p_name.IBLOCK_PROPERTY_ID = 85
+        LEFT JOIN b_iblock_element_property p_article ON 
+            e.ID = p_article.IBLOCK_ELEMENT_ID AND p_article.IBLOCK_PROPERTY_ID = 86
         WHERE e.IBLOCK_ID = %s 
-        AND e.ACTIVE = 'Y'
-        AND p.VALUE LIKE %s
+            AND e.ACTIVE = 'Y'
+            AND p_article.VALUE LIKE %s
         ORDER BY e.ID
         """
         
         cursor.execute(query, (
-            self.config.iblock_id,
-            article_field,
             self.config.iblock_id,
             f"{self.config.supplier_prefix}%"
         ))
@@ -166,7 +166,7 @@ class BitrixClient:
                 id=row['ID'],
                 name=row['NAME'],
                 article=row['ARTICLE'],
-                section_id=row['SECTION_ID'],
+                section_id=None,
                 active=row['ACTIVE'] == 'Y'
             ))
         
@@ -174,8 +174,8 @@ class BitrixClient:
         logger.info(f"Найдено товаров Saturn: {len(products)}")
         return products
     
-    def get_markup_rules(self) -> List[BitrixMarkupRule]:
-        """Получение правил наценок из информационного блока"""
+    def get_markup_rule_for_product(self, product_id: int) -> Optional[Dict]:
+        """Получение правила наценки для товара"""
         if not self.connection:
             raise RuntimeError("Нет подключения к базе данных")
         
@@ -193,12 +193,33 @@ class BitrixClient:
         iblock_row = cursor.fetchone()
         if not iblock_row:
             logger.warning("Информационный блок с наценками не найден")
-            return []
+            return None
         
         markup_iblock_id = iblock_row['ID']
         logger.info(f"Используем информационный блок наценок: {markup_iblock_id}")
         
-        # Получение правил наценок
+        article_query = """
+        SELECT p_article.VALUE as ARTICLE
+        FROM b_iblock_element e
+        LEFT JOIN b_iblock_element_property p_article ON 
+            e.ID = p_article.IBLOCK_ELEMENT_ID AND p_article.IBLOCK_PROPERTY_ID = 86
+        WHERE e.ID = %s
+        """
+        
+        cursor.execute(article_query, (product_id,))
+        article_row = cursor.fetchone()
+        if not article_row:
+            logger.warning(f"Не найден артикул для товара {product_id}")
+            return None
+        
+        article = article_row['ARTICLE']
+        
+        rule_patterns = {
+            'pattern': article,
+            'price_code': 'BASE',
+            'extra': 0
+        }
+        
         query = """
         SELECT 
             e.ID,
@@ -244,45 +265,37 @@ class BitrixClient:
         for row in cursor.fetchall():
             try:
                 markup_percent = float(row['MARKUP_PERCENT'] or 0)
-                rules.append(BitrixMarkupRule(
-                    id=row['ID'],
-                    name=row['NAME'],
-                    section_id=row['SECTION_ID'],
-                    price_code_from=row['PRICE_CODE_FROM'] or 'BASE',
-                    price_code_to=row['PRICE_CODE_TO'] or 'BASE',
-                    markup_percent=markup_percent,
-                    active=row['ACTIVE'] == 'Y',
-                    sort=row['SORT'] or 500
-                ))
+                rules.append({
+                    'id': row['ID'],
+                    'name': row['NAME'],
+                    'section_id': row['SECTION_ID'],
+                    'price_code_from': row['PRICE_CODE_FROM'] or 'BASE',
+                    'price_code_to': row['PRICE_CODE_TO'] or 'BASE',
+                    'markup_percent': markup_percent,
+                    'active': row['ACTIVE'] == 'Y',
+                    'sort': row['SORT'] or 500
+                })
             except (ValueError, TypeError) as e:
                 logger.warning(f"Ошибка обработки правила {row['ID']}: {e}")
         
         cursor.close()
-        logger.info(f"Загружено правил наценок: {len(rules)}")
-        return rules
-    
-    def find_applicable_markup_rule(self, section_id: Optional[int], rules: List[BitrixMarkupRule]) -> Optional[BitrixMarkupRule]:
-        """Поиск применимого правила наценки для товара"""
-        if not rules:
-            return None
         
-        # Сортировка правил по приоритету
-        sorted_rules = sorted(rules, key=lambda r: (r.sort, r.id))
-        
-        # Поиск правила для конкретной секции
-        if section_id:
-            for rule in sorted_rules:
-                if rule.section_id == section_id and rule.active:
-                    return rule
-        
-        # Поиск общего правила (без привязки к секции)
-        for rule in sorted_rules:
-            if rule.section_id is None and rule.active:
+        for rule in rules:
+            if self.is_markup_rule_applicable(rule, article):
                 return rule
         
         return None
     
-    def update_product_price(self, product_id: int, price: float, price_type_id: int = 1) -> bool:
+    def is_markup_rule_applicable(self, rule: Dict, article: str) -> bool:
+        """Проверка применимости правила наценки"""
+        if rule['section_id'] is None:
+            return True
+        
+        # TODO: реализовать логику проверки применимости правила
+        
+        return False
+    
+    def update_product_price(self, product_id: int, new_price: float, old_price: float = None) -> bool:
         """Обновление цены товара в Bitrix"""
         if not self.connection:
             raise RuntimeError("Нет подключения к базе данных")
@@ -290,32 +303,35 @@ class BitrixClient:
         cursor = self.connection.cursor()
         
         try:
-            # Проверяем, существует ли цена
-            cursor.execute("""
-            SELECT ID FROM b_catalog_price 
-            WHERE PRODUCT_ID = %s AND CATALOG_GROUP_ID = %s
-            """, (product_id, price_type_id))
+            query = """
+                SELECT cp.PRICE 
+                FROM b_catalog_price cp
+                WHERE cp.PRODUCT_ID = %s 
+                    AND cp.CATALOG_GROUP_ID = 1
+                ORDER BY cp.ID DESC
+                LIMIT 1
+            """
             
+            cursor.execute(query, (product_id,))
             existing_price = cursor.fetchone()
             
             if existing_price:
-                # Обновляем существующую цену
                 update_query = """
-                UPDATE b_catalog_price 
-                SET PRICE = %s, TIMESTAMP_X = NOW()
-                WHERE PRODUCT_ID = %s AND CATALOG_GROUP_ID = %s
+                    UPDATE b_catalog_price 
+                    SET PRICE = %s, PRICE_SCALE = %s
+                    WHERE PRODUCT_ID = %s AND CATALOG_GROUP_ID = 1
                 """
-                cursor.execute(update_query, (price, product_id, price_type_id))
-                logger.debug(f"Обновлена цена для товара {product_id}: {price} руб.")
+                cursor.execute(update_query, (new_price, new_price, product_id))
+                logger.debug(f"Обновлена цена для товара {product_id}: {old_price} → {new_price} руб.")
             else:
-                # Создаем новую цену
-                insert_query = """
-                INSERT INTO b_catalog_price 
-                (PRODUCT_ID, CATALOG_GROUP_ID, PRICE, CURRENCY, TIMESTAMP_X)
-                VALUES (%s, %s, %s, 'RUB', NOW())
-                """
-                cursor.execute(insert_query, (product_id, price_type_id, price))
-                logger.debug(f"Создана новая цена для товара {product_id}: {price} руб.")
+                if cursor.rowcount == 0:
+                    insert_query = """
+                        INSERT INTO b_catalog_price 
+                        (PRODUCT_ID, CATALOG_GROUP_ID, PRICE, CURRENCY, TIMESTAMP_X)
+                        VALUES (%s, %s, %s, 'RUB', NOW())
+                    """
+                    cursor.execute(insert_query, (product_id, 1, new_price))
+                    logger.debug(f"Создана новая цена для товара {product_id}: {new_price} руб.")
             
             # autocommit=True уже установлен, commit() не нужен
             return True
@@ -327,7 +343,7 @@ class BitrixClient:
         finally:
             cursor.close()
     
-    def trigger_underprice_module(self) -> bool:
+    def trigger_underprice_module(self, product_id: int):
         """Запуск модуля underprice для пересчета скидок"""
         try:
             # Используем новый Python модуль underprice вместо HTTP запроса
@@ -350,19 +366,14 @@ class BitrixClient:
             logger.error(f"Ошибка выполнения underprice: {e}")
             return False
     
-    def _trigger_underprice_http(self) -> bool:
+    def _trigger_underprice_http(self):
         """Запуск underprice через HTTP (fallback метод)"""
         if not self.config.underprice_url or not self.config.underprice_password:
             logger.info("Настройки underprice не заданы, пропускаем")
             return True
         
         try:
-            import requests
-            response = requests.post(
-                self.config.underprice_url,
-                data={'password': self.config.underprice_password},
-                timeout=300  # 5 минут на выполнение
-            )
+            response = requests.post(self.config.underprice_url, data={'password': self.config.underprice_password}, timeout=30)
             
             if response.status_code == 200:
                 logger.info("Модуль underprice успешно запущен")
@@ -389,13 +400,10 @@ class MarkupProcessor:
     
     def apply_markup(self, product: BitrixProduct, original_price: float) -> Tuple[float, float]:
         """Применение наценки к цене товара"""
-        rule = self.bitrix_client.find_applicable_markup_rule(
-            product.section_id, 
-            self.markup_rules
-        )
+        markup_rule = self.bitrix_client.get_markup_rule_for_product(product.id)
         
-        if rule:
-            markup_percent = rule.markup_percent
+        if markup_rule:
+            markup_percent = markup_rule['markup_percent']
             final_price = original_price * (1 + markup_percent / 100)
             logger.debug(f"Товар {product.article}: {original_price} → {final_price:.2f} (+{markup_percent}%)")
             return final_price, markup_percent
@@ -431,64 +439,63 @@ def process_saturn_prices(input_csv: str, config: BitrixConfig, output_csv: str 
     
     logger.info(f"Загружено цен Saturn: {len(saturn_prices)}")
     
-    # Подключение к Bitrix
-    with BitrixClient(config) as bitrix:
-        # Загрузка товаров и правил наценок
-        products = bitrix.get_products_by_prefix()
-        markup_processor = MarkupProcessor(bitrix)
-        markup_processor.load_markup_rules()
+    bitrix_client = BitrixClient(config)
+    
+    # Загрузка товаров
+    products = bitrix_client.get_products_by_prefix()
+    
+    # Обработка товаров
+    processed_count = 0
+    updated_count = 0
+    results = []
+    
+    for product in products:
+        # Удаляем префикс для поиска в Saturn
+        saturn_sku = product.article.replace(config.supplier_prefix, '')
         
-        # Обработка товаров
-        processed_count = 0
-        updated_count = 0
-        results = []
-        
-        for product in products:
-            # Удаляем префикс для поиска в Saturn
-            saturn_sku = product.article.replace(config.supplier_prefix, '')
+        if saturn_sku in saturn_prices:
+            saturn_data = saturn_prices[saturn_sku]
+            original_price = saturn_data['price']
             
-            if saturn_sku in saturn_prices:
-                saturn_data = saturn_prices[saturn_sku]
-                original_price = saturn_data['price']
-                
-                # Применение наценки
-                final_price, markup_percent = markup_processor.apply_markup(product, original_price)
-                
-                # Обновление цены в Bitrix
-                if bitrix.update_product_price(product.id, final_price):
-                    updated_count += 1
-                    logger.info(f"✅ {product.article}: {original_price} → {final_price:.2f} руб.")
-                else:
-                    logger.error(f"❌ Ошибка обновления цены для {product.article}")
-                
-                # Сохранение результата
-                results.append({
-                    'sku': product.article,
-                    'name': product.name,
-                    'original_price': original_price,
-                    'markup_percent': markup_percent,
-                    'final_price': final_price,
-                    'section_id': product.section_id,
-                    'updated_at': datetime.now().isoformat()
-                })
-                
-                processed_count += 1
-        
-        # Сохранение результатов в CSV
-        if output_csv and results:
-            with open(output_csv, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.DictWriter(f, fieldnames=results[0].keys(), delimiter=';')
-                writer.writeheader()
-                writer.writerows(results)
-            logger.info(f"Результаты сохранены: {output_csv}")
-        
-        # Запуск модуля скидок
-        if updated_count > 0:
-            logger.info("Запускаем пересчет скидок...")
-            bitrix.trigger_underprice_module()
-        
-        logger.info(f"Обработка завершена. Обработано: {processed_count}, обновлено: {updated_count}")
-        return updated_count > 0
+            # Применение наценки
+            final_price, markup_percent = MarkupProcessor(bitrix_client).apply_markup(product, original_price)
+            
+            # Обновление цены в Bitrix
+            if bitrix_client.update_product_price(product.id, final_price, original_price):
+                updated_count += 1
+                logger.info(f"✅ {product.article}: {original_price} → {final_price:.2f} руб.")
+            else:
+                logger.error(f"❌ Ошибка обновления цены для {product.article}")
+            
+            # Сохранение результата
+            results.append({
+                'sku': product.article,
+                'name': product.name,
+                'original_price': original_price,
+                'markup_percent': markup_percent,
+                'final_price': final_price,
+                'section_id': product.section_id,
+                'updated_at': datetime.now().isoformat()
+            })
+            
+            processed_count += 1
+    
+    # Сохранение результатов в CSV
+    if output_csv and results:
+        with open(output_csv, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=results[0].keys(), delimiter=';')
+            writer.writeheader()
+            writer.writerows(results)
+        logger.info(f"Результаты сохранены: {output_csv}")
+    
+    # Запуск модуля скидок
+    if updated_count > 0:
+        logger.info("Запускаем пересчет скидок...")
+        for product in products:
+            bitrix_client.trigger_underprice_module(product.id)
+    
+    logger.info(f"Обработка завершена. Обработано: {processed_count}, обновлено: {updated_count}")
+    return updated_count > 0
 
 
 def main():
@@ -528,6 +535,5 @@ def main():
 
 
 if __name__ == '__main__':
-    import sys
     logging.basicConfig(level=logging.INFO)
     sys.exit(main())

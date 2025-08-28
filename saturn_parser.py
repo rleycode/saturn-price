@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-"""
-Saturn Price Parser - Автономный парсер цен с сайта Saturn
-"""
 
 import os
 import sys
@@ -19,12 +16,9 @@ import logging
 from logging.handlers import RotatingFileHandler
 from bs4 import BeautifulSoup
 
-# Настройка логирования
 def setup_logging():
-    """Настройка логирования с ротацией файлов"""
     logger = logging.getLogger(__name__)
     
-    # Проверяем, есть ли уже обработчики
     if logger.handlers:
         return logger
     
@@ -32,10 +26,9 @@ def setup_logging():
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
     
-    # Ротация логов (максимум 2 файла по 10MB)
     handler = RotatingFileHandler(
         log_dir / "saturn_parser.log",
-        maxBytes=10*1024*1024,  # 10MB
+        maxBytes=10*1024*1024,
         backupCount=1
     )
     
@@ -45,7 +38,6 @@ def setup_logging():
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     
-    # Консольный вывод
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
@@ -57,7 +49,6 @@ logger = setup_logging()
 
 @dataclass
 class ProductPrice:
-    """Цена товара с Saturn"""
     sku: str
     name: str
     price: float
@@ -68,7 +59,6 @@ class ProductPrice:
 
 
 class ProcessLock:
-    """Блокировка процесса для предотвращения одновременных запусков"""
     
     def __init__(self, lock_file: str):
         self.lock_file = Path(lock_file)
@@ -76,22 +66,18 @@ class ProcessLock:
     
     def __enter__(self):
         if self.lock_file.exists():
-            # Проверяем, не завис ли процесс
             try:
                 with open(self.lock_file, 'r') as f:
                     pid = int(f.read().strip())
                 
-                # Проверяем, существует ли процесс (Linux/Unix)
                 try:
                     os.kill(pid, 0)
                     raise RuntimeError(f"Процесс уже запущен (PID: {pid})")
                 except OSError:
-                    # Процесс не существует, удаляем старый lock
                     self.lock_file.unlink()
             except (ValueError, FileNotFoundError):
                 self.lock_file.unlink()
         
-        # Создаем новый lock
         with open(self.lock_file, 'w') as f:
             f.write(str(os.getpid()))
         
@@ -104,7 +90,6 @@ class ProcessLock:
 
 
 class SaturnParser:
-    """Парсер цен с сайта Saturn"""
     
     def __init__(self):
         self.base_url = "https://nnv.saturn.net"
@@ -118,12 +103,10 @@ class SaturnParser:
             'Upgrade-Insecure-Requests': '1',
         })
         
-        # Настройки парсинга
-        self.request_delay = 1.0  # Задержка между запросами
+        self.request_delay = 1.0
         self.max_retries = 3
         self.timeout = 30
         
-        # Регулярные выражения для парсинга
         self.price_patterns = [
             r'<span[^>]*class="[^"]*price[^"]*"[^>]*>([0-9\s,\.]+)',
             r'"price":\s*"?([0-9\s,\.]+)"?',
@@ -139,7 +122,6 @@ class SaturnParser:
         ]
     
     def _make_request(self, url: str) -> Optional[requests.Response]:
-        """Безопасный HTTP запрос с повторными попытками"""
         for attempt in range(self.max_retries):
             try:
                 time.sleep(self.request_delay)
@@ -148,7 +130,6 @@ class SaturnParser:
                 if response.status_code == 200:
                     return response
                 elif response.status_code == 429:
-                    # Слишком много запросов - увеличиваем задержку
                     wait_time = (attempt + 1) * 5
                     logger.warning(f"Rate limit hit, waiting {wait_time}s")
                     time.sleep(wait_time)
@@ -163,7 +144,6 @@ class SaturnParser:
         return None
     
     def _extract_price(self, html: str) -> Optional[float]:
-        """Извлечение цены из HTML"""
         for pattern in self.price_patterns:
             matches = re.findall(pattern, html, re.IGNORECASE)
             if matches:
@@ -175,22 +155,18 @@ class SaturnParser:
         return None
     
     def _extract_name(self, html: str) -> Optional[str]:
-        """Извлечение названия товара из HTML"""
         for pattern in self.name_patterns:
             matches = re.findall(pattern, html, re.IGNORECASE | re.DOTALL)
             if matches:
                 name = matches[0].strip()
-                # Очистка названия от лишних символов
                 name = re.sub(r'\s+', ' ', name)
-                if len(name) > 5:  # Минимальная длина названия
+                if len(name) > 5:
                     return name
         return None
     
     def _search_product_data(self, sku: str) -> Optional[dict]:
-        """Поиск данных товара по артикулу на странице результатов"""
         search_queries = [
-            f"тов-{sku}",  # Полный артикул с префиксом
-            sku,
+            f"тов-{sku}",            sku,
             sku.replace('-', ''),
             sku.replace('_', ''),
             sku.upper(),
@@ -204,29 +180,23 @@ class SaturnParser:
             if not response:
                 continue
             
-            # Используем BeautifulSoup для более точного парсинга
             soup = BeautifulSoup(response.text, 'html.parser')
             
-            # Проверяем, что найден конкретный товар (не страница каталога)
             page_text = soup.get_text()
             
-            # Если это страница каталога, ищем прямую ссылку на товар
             if "найдено:" in page_text.lower() and "товар" in page_text.lower():
                 logger.info(f"Найдена страница результатов поиска для {sku}")
                 
-                # Ищем ссылки на конкретные товары
                 product_links = soup.find_all('a', href=re.compile(r'/catalog/[^/]+/[^/]+/$'))
                 
                 for link in product_links:
                     link_text = link.get_text(strip=True).lower()
                     href = link.get('href')
                     
-                    # Проверяем, содержит ли ссылка наш артикул или подходящие ключевые слова
                     if (sku in link_text or 
                         f"тов-{sku}" in link_text or
                         any(keyword in link_text for keyword in ["брусок", "строганый", "сухой"])):
                         
-                        # Переходим на страницу товара
                         if not href.startswith('http'):
                             product_url = urljoin(self.base_url, href)
                         else:
@@ -234,31 +204,26 @@ class SaturnParser:
                         
                         logger.info(f"Найдена ссылка на товар: {product_url}")
                         
-                        # Загружаем страницу товара
                         product_response = self._make_request(product_url)
                         if not product_response:
                             continue
                         
                         product_soup = BeautifulSoup(product_response.text, 'html.parser')
                         
-                        # Ищем цены на странице товара
                         price_elements = product_soup.find_all(attrs={'data-price': True})
                         
                         if price_elements:
                             try:
-                                # Берем первую найденную цену
                                 price_value = price_elements[0].get('data-price')
                                 price = float(price_value)
                                 
-                                # Ищем название товара
                                 name = None
                                 
-                                # Поиск в заголовках
                                 for tag in ['h1', 'h2', 'title']:
                                     title_elem = product_soup.find(tag)
                                     if title_elem:
                                         name = title_elem.get_text(strip=True)
-                                        if len(name) > 10:  # Фильтруем короткие названия
+                                        if len(name) > 10:
                                             break
                                 
                                 if not name:
@@ -279,7 +244,6 @@ class SaturnParser:
                                 logger.warning(f"Ошибка парсинга цены для {sku}: {e}")
                                 continue
             
-            # Если не нашли на странице результатов, пробуем старую логику
             sku_with_prefix = f"тов-{sku}"
             elements_with_sku = soup.find_all(string=re.compile(re.escape(sku_with_prefix)))
             
@@ -303,19 +267,17 @@ class SaturnParser:
                             if sku_pos == -1:
                                 sku_pos = text_content.find(sku)
                             
-                            name = None  # Инициализируем переменную
+                            name = None
                             
                             if sku_pos != -1:
                                 start = max(0, sku_pos - 100)
                                 end = min(len(text_content), sku_pos + 200)
                                 context = text_content[start:end]
                                 
-                                # Ищем название в контексте
                                 lines = context.split('\n')
                                 for line in lines:
                                     line = line.strip()
                                     if len(line) > 10 and sku not in line and 'руб' not in line.lower():
-                                        # Это может быть название товара
                                         if any(word in line.lower() for word in ['брусок', 'доска', 'рейка', 'балка']):
                                             name = line
                                             break
@@ -338,10 +300,8 @@ class SaturnParser:
         return None
     
     def parse_product(self, sku: str) -> Optional[ProductPrice]:
-        """Парсинг товара по артикулу"""
         logger.info(f"Парсинг товара: {sku}")
         
-        # Поиск данных товара на странице результатов
         product_data = self._search_product_data(sku)
         if not product_data:
             logger.warning(f"Товар не найден: {sku}")
@@ -358,7 +318,6 @@ class SaturnParser:
         )
     
     def parse_products(self, skus: List[str], output_file: str = None) -> List[ProductPrice]:
-        """Парсинг списка товаров"""
         results = []
         total = len(skus)
         
@@ -378,7 +337,6 @@ class SaturnParser:
             except Exception as e:
                 logger.error(f"Ошибка парсинга {sku}: {e}")
         
-        # Сохранение результатов
         if output_file:
             self.save_results(results, output_file)
         
@@ -386,7 +344,6 @@ class SaturnParser:
         return results
     
     def save_results(self, results: List[ProductPrice], output_file: str):
-        """Сохранение результатов в CSV"""
         output_path = Path(output_file)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
@@ -409,7 +366,6 @@ class SaturnParser:
 
 
 def load_skus_from_file(file_path: str) -> List[str]:
-    """Загрузка артикулов из файла"""
     skus = []
     with open(file_path, 'r', encoding='utf-8') as f:
         for line in f:
@@ -420,7 +376,6 @@ def load_skus_from_file(file_path: str) -> List[str]:
 
 
 def main():
-    """Главная функция"""
     import argparse
     
     parser = argparse.ArgumentParser(description='Saturn Price Parser')
@@ -431,11 +386,9 @@ def main():
     
     args = parser.parse_args()
     
-    # Блокировка одновременных запусков
     with ProcessLock('/tmp/saturn_parser.lock'):
         saturn_parser = SaturnParser()
         
-        # Определение списка артикулов
         if args.sku:
             skus = [args.sku]
         elif args.skus:
@@ -444,12 +397,10 @@ def main():
             logger.error("Укажите --sku или --skus")
             return 1
         
-        # Ограничение размера пакета
         if len(skus) > args.batch_size:
             logger.info(f"Ограничиваем до {args.batch_size} товаров")
             skus = skus[:args.batch_size]
         
-        # Парсинг
         start_time = time.time()
         results = saturn_parser.parse_products(skus, args.output)
         elapsed = time.time() - start_time

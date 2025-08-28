@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-"""
-Full Sync - Полная синхронизация Saturn с Bitrix
-"""
 
 import os
 import sys
@@ -13,36 +10,28 @@ import logging
 from typing import List, Optional
 from dotenv import load_dotenv
 
-# Загружаем переменные окружения из .env
 load_dotenv()
 
-# Импорт наших модулей
 from saturn_parser import SaturnParser, ProcessLock, load_skus_from_file
 from bitrix_integration import BitrixClient, BitrixConfig, process_saturn_prices
 
 logger = logging.getLogger(__name__)
 
-
 class FullSyncManager:
-    """Менеджер полной синхронизации"""
     
     def __init__(self, config_file: str = None):
         self.config = self._load_config(config_file)
         self.output_dir = Path("output")
         self.output_dir.mkdir(exist_ok=True)
-        
-        # Файлы для этапов синхронизации
         self.raw_prices_file = self.output_dir / "saturn_raw_prices.csv"
         self.processed_prices_file = self.output_dir / "saturn_processed_prices.csv"
         
     def _load_config(self, config_file: str = None) -> BitrixConfig:
-        """Загрузка конфигурации"""
         if config_file and Path(config_file).exists():
             with open(config_file, 'r', encoding='utf-8') as f:
                 config_data = json.load(f)
             return BitrixConfig(**config_data)
         else:
-            # Конфигурация из переменных окружения
             return BitrixConfig(
                 mysql_host=os.getenv('BITRIX_MYSQL_HOST', 'localhost'),
                 mysql_port=int(os.getenv('BITRIX_MYSQL_PORT', 3306)),
@@ -56,10 +45,7 @@ class FullSyncManager:
             )
     
     def get_saturn_skus(self) -> List[str]:
-        """Получение списка артикулов Saturn из Bitrix"""
         logger.info("Получение списка артикулов Saturn из Bitrix...")
-        
-        # Создаем отдельное подключение для получения SKU
         bitrix_client = BitrixClient(self.config)
         try:
             if not bitrix_client.connect():
@@ -68,7 +54,6 @@ class FullSyncManager:
             
             products = bitrix_client.get_products_by_prefix()
             
-            # Извлекаем артикулы без префикса
             skus = []
             for product in products:
                 saturn_sku = product.article.replace(self.config.supplier_prefix, '')
@@ -78,11 +63,9 @@ class FullSyncManager:
             return skus
             
         finally:
-            # Явно закрываем соединение после получения SKU
             bitrix_client.disconnect()
     
-    def stage1_parse_prices(self, skus: List[str] = None, batch_size: int = None) -> bool:
-        """Этап 1: Парсинг цен с Saturn"""
+    def stage1_parse_prices(self, skus: List[str] = None, batch_size: int = None, use_fast_parser: bool = True) -> bool:
         logger.info("=== ЭТАП 1: Парсинг цен с Saturn ===")
         
         if not skus:
@@ -92,17 +75,23 @@ class FullSyncManager:
             logger.error("Нет артикулов для парсинга")
             return False
         
-        # Ограничение размера пакета
         if batch_size and len(skus) > batch_size:
             logger.info(f"Ограничиваем до {batch_size} товаров")
             skus = skus[:batch_size]
         
-        # Парсинг
-        saturn_parser = SaturnParser()
         start_time = time.time()
         
         try:
-            results = saturn_parser.parse_products(skus, str(self.raw_prices_file))
+            if use_fast_parser:
+                from fast_saturn_parser import FastSaturnParser
+                workers = min(20, max(5, len(skus) // 100))
+                logger.info(f"Используем быстрый парсер с {workers} потоками")
+                fast_parser = FastSaturnParser(max_workers=workers, request_delay=0.05)
+                results = fast_parser.parse_products_batch(skus, str(self.raw_prices_file))
+            else:
+                saturn_parser = SaturnParser()
+                results = saturn_parser.parse_products(skus, str(self.raw_prices_file))
+            
             elapsed = time.time() - start_time
             
             logger.info(f"Этап 1 завершен за {elapsed:.1f}с")
@@ -115,7 +104,6 @@ class FullSyncManager:
             return False
     
     def stage2_process_markups(self) -> bool:
-        """Этап 2: Применение наценок и обновление Bitrix"""
         logger.info("=== ЭТАП 2: Применение наценок и обновление Bitrix ===")
         
         if not self.raw_prices_file.exists():
@@ -140,30 +128,25 @@ class FullSyncManager:
             logger.error(f"Ошибка обработки наценок: {e}")
             return False
     
-    def run_full_sync(self, batch_size: int = None, skus_file: str = None) -> bool:
-        """Запуск полной синхронизации"""
+    def run_full_sync(self, batch_size: int = None, skus_file: str = None, use_fast_parser: bool = True) -> bool:
         logger.info("🚀 Запуск полной синхронизации Saturn → Bitrix")
         start_time = time.time()
         
         try:
-            # Определение списка артикулов
             if skus_file:
                 skus = load_skus_from_file(skus_file)
                 logger.info(f"Загружено артикулов из файла: {len(skus)}")
             else:
                 skus = None
             
-            # Этап 1: Парсинг
-            if not self.stage1_parse_prices(skus, batch_size):
+            if not self.stage1_parse_prices(skus, batch_size, use_fast_parser):
                 logger.error("Ошибка на этапе парсинга")
                 return False
             
-            # Этап 2: Наценки и обновление
             if not self.stage2_process_markups():
                 logger.error("Ошибка на этапе обработки наценок")
                 return False
             
-            # Итоговая статистика
             elapsed = time.time() - start_time
             logger.info(f"✅ Полная синхронизация завершена за {elapsed:.1f}с")
             
@@ -174,7 +157,6 @@ class FullSyncManager:
             return False
     
     def cleanup_old_files(self, days: int = 7):
-        """Очистка старых файлов"""
         logger.info(f"Очистка файлов старше {days} дней...")
         
         cutoff_time = time.time() - (days * 24 * 60 * 60)
@@ -190,51 +172,52 @@ class FullSyncManager:
 
 
 def main():
-    """Главная функция"""
     import argparse
     
     parser = argparse.ArgumentParser(description='Saturn Full Sync')
     parser.add_argument('--config', help='JSON файл с конфигурацией')
     parser.add_argument('--skus-file', help='Файл с артикулами для парсинга')
-    parser.add_argument('--batch-size', type=int, default=100, help='Размер пакета')
+    parser.add_argument('--batch-size', type=int, default=None, help='Размер пакета (по умолчанию без ограничений)')
     parser.add_argument('--parse-only', action='store_true', help='Только парсинг без обновления Bitrix')
     parser.add_argument('--process-only', action='store_true', help='Только обработка существующего файла')
     parser.add_argument('--cleanup', action='store_true', help='Очистка старых файлов')
     parser.add_argument('--test-mode', action='store_true', help='Тестовый режим (ограниченное количество товаров)')
+    parser.add_argument('--slow-parser', action='store_true', help='Использовать медленный парсер вместо быстрого')
     
     args = parser.parse_args()
     
-    # Настройка логирования
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     
-    # Тестовый режим
     if args.test_mode:
         args.batch_size = min(args.batch_size, 10)
         logger.info("🧪 ТЕСТОВЫЙ РЕЖИМ: ограничено 10 товарами")
     
-    # Блокировка одновременных запусков
     lock_file = "/tmp/saturn_full_sync.lock" if os.name != 'nt' else "saturn_full_sync.lock"
     
     try:
         with ProcessLock(lock_file):
             sync_manager = FullSyncManager(args.config)
             
-            # Очистка старых файлов
             if args.cleanup:
                 sync_manager.cleanup_old_files()
             
-            # Выполнение синхронизации
+            use_fast_parser = not args.slow_parser
+            
             if args.parse_only:
-                success = sync_manager.stage1_parse_prices(batch_size=args.batch_size)
+                success = sync_manager.stage1_parse_prices(
+                    batch_size=args.batch_size, 
+                    use_fast_parser=use_fast_parser
+                )
             elif args.process_only:
                 success = sync_manager.stage2_process_markups()
             else:
                 success = sync_manager.run_full_sync(
                     batch_size=args.batch_size,
-                    skus_file=args.skus_file
+                    skus_file=args.skus_file,
+                    use_fast_parser=use_fast_parser
                 )
             
             return 0 if success else 1

@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""
-Улучшенная Python версия модуля underprice
-Прямая работа с базой данных для максимальной производительности
-"""
 
 import os
 import sys
@@ -14,26 +10,22 @@ import mysql.connector
 from mysql.connector import Error
 from dotenv import load_dotenv
 
-# Загрузка переменных окружения
 load_dotenv()
 
-# Настройка логирования
 logger = logging.getLogger('underprice_python')
 
 @dataclass
 class UnderpriceRule:
-    """Правило пересчета цен"""
     id: int
     iblock_id: int
     section_id: Optional[int]
-    price_code_from: str  # Исходная группа цен
-    price_code_to: str    # Целевая группа цен
-    percent: float        # Процент скидки/наценки
+    price_code_from: str
+    price_code_to: str
+    percent: float
     sort: int
 
 @dataclass
 class ProductInfo:
-    """Информация о товаре"""
     id: int
     name: str
     article: str
@@ -41,17 +33,15 @@ class ProductInfo:
     current_price: Optional[float]
 
 class UnderpriceProcessor:
-    """Обработчик пересчета цен по правилам underprice"""
     
     def __init__(self):
         self.connection = None
         self.rules = []
         self.processed_count = 0
         self.updated_count = 0
-        self.price_groups = {}  # Кэш групп цен
+        self.price_groups = {}
     
     def connect(self):
-        """Подключение к MySQL"""
         try:
             self.connection = mysql.connector.connect(
                 host=os.getenv('BITRIX_MYSQL_HOST', '127.0.0.1'),
@@ -69,13 +59,11 @@ class UnderpriceProcessor:
             raise
     
     def disconnect(self):
-        """Отключение от MySQL"""
         if self.connection:
             self.connection.close()
             logger.info("Соединение с MySQL закрыто")
     
     def load_price_groups(self):
-        """Загрузка групп цен"""
         cursor = self.connection.cursor(dictionary=True)
         cursor.execute("SELECT ID, NAME, BASE FROM b_catalog_group ORDER BY SORT")
         
@@ -89,8 +77,6 @@ class UnderpriceProcessor:
         logger.info(f"Загружено групп цен: {len(self.price_groups)}")
     
     def get_price_group_by_code(self, code: str) -> Optional[int]:
-        """Получение ID группы цен по коду"""
-        # Простое сопоставление кодов с ID групп
         code_mapping = {
             'BASE': 1,
             'RETAIL': 2,
@@ -100,10 +86,8 @@ class UnderpriceProcessor:
         return code_mapping.get(code)
     
     def load_underprice_rules(self) -> List[UnderpriceRule]:
-        """Загрузка правил underprice из настроек модуля"""
         cursor = self.connection.cursor(dictionary=True)
         
-        # Получаем ID информационного блока настроек из опций
         cursor.execute("""
         SELECT VALUE FROM b_option 
         WHERE MODULE_ID = 'mcart.underprice' AND NAME = 'SETTINGS_IBLOCK_ID'
@@ -117,7 +101,6 @@ class UnderpriceProcessor:
         settings_iblock_id = int(settings_row['VALUE'])
         logger.info(f"ID блока настроек underprice: {settings_iblock_id}")
         
-        # Получаем правила из информационного блока
         query = """
         SELECT 
             e.ID,
@@ -175,7 +158,6 @@ class UnderpriceProcessor:
         rules = []
         for row in cursor.fetchall():
             try:
-                # Получаем коды групп цен из enum значений
                 price_from_code = self.get_enum_xml_id(row['PRICE_CODE_FROM_ENUM_ID'])
                 price_to_code = self.get_enum_xml_id(row['PRICE_CODE_TO_ENUM_ID'])
                 
@@ -197,7 +179,6 @@ class UnderpriceProcessor:
         return rules
     
     def get_enum_xml_id(self, enum_id: int) -> Optional[str]:
-        """Получение XML_ID значения enum свойства"""
         if not enum_id:
             return None
             
@@ -211,7 +192,6 @@ class UnderpriceProcessor:
     
     def get_products_for_processing(self, iblock_id: int, section_id: Optional[int] = None, 
                                    batch_size: int = 1000, offset: int = 0) -> List[ProductInfo]:
-        """Получение товаров для обработки"""
         cursor = self.connection.cursor(dictionary=True)
         
         where_conditions = ["e.ACTIVE = 'Y'", "e.IBLOCK_ID = %s"]
@@ -250,14 +230,13 @@ class UnderpriceProcessor:
                 name=row['NAME'],
                 article=row['ARTICLE'] or '',
                 section_id=row['SECTION_ID'],
-                current_price=None  # Будет загружена отдельно
+                current_price=None
             ))
         
         cursor.close()
         return products
     
     def get_product_price(self, product_id: int, price_group_id: int) -> Optional[float]:
-        """Получение цены товара из определенной группы"""
         cursor = self.connection.cursor(dictionary=True)
         cursor.execute("""
         SELECT PRICE FROM b_catalog_price 
@@ -270,11 +249,9 @@ class UnderpriceProcessor:
         return float(row['PRICE']) if row else None
     
     def update_product_price(self, product_id: int, price_group_id: int, new_price: float) -> bool:
-        """Обновление цены товара"""
         cursor = self.connection.cursor()
         
         try:
-            # Проверяем, существует ли цена
             cursor.execute("""
             SELECT ID FROM b_catalog_price 
             WHERE PRODUCT_ID = %s AND CATALOG_GROUP_ID = %s
@@ -283,14 +260,12 @@ class UnderpriceProcessor:
             existing = cursor.fetchone()
             
             if existing:
-                # Обновляем существующую цену
                 cursor.execute("""
                 UPDATE b_catalog_price 
                 SET PRICE = %s, TIMESTAMP_X = NOW()
                 WHERE PRODUCT_ID = %s AND CATALOG_GROUP_ID = %s
                 """, (new_price, product_id, price_group_id))
             else:
-                # Создаем новую цену
                 cursor.execute("""
                 INSERT INTO b_catalog_price 
                 (PRODUCT_ID, CATALOG_GROUP_ID, PRICE, CURRENCY, TIMESTAMP_X)
@@ -306,11 +281,9 @@ class UnderpriceProcessor:
             cursor.close()
     
     def process_underprice_rules(self):
-        """Основной процесс обработки правил underprice (по логике PHP)"""
         logger.info("🔄 Начинаем обработку правил underprice...")
         start_time = datetime.now()
         
-        # Загружаем группы цен и правила
         self.load_price_groups()
         self.rules = self.load_underprice_rules()
         
@@ -318,11 +291,9 @@ class UnderpriceProcessor:
             logger.warning("Правила underprice не найдены")
             return
         
-        # Обрабатываем каждое правило (profile)
         for profile_id, rule in enumerate(self.rules):
             logger.info(f"📋 Profile {profile_id}: {rule.price_code_from} → {rule.price_code_to} ({rule.percent}%)")
             
-            # Получаем ID групп цен
             price_from_id = self.get_price_group_by_code(rule.price_code_from)
             price_to_id = self.get_price_group_by_code(rule.price_code_to)
             
@@ -330,13 +301,11 @@ class UnderpriceProcessor:
                 logger.warning(f"Не найдены группы цен для правила {rule.id}")
                 continue
             
-            # Обрабатываем товары пакетами по 50 (как в PHP)
             element_id = 0
             rule_processed = 0
             rule_updated = 0
             
             while True:
-                # Получаем следующие 50 товаров (как в PHP: nTopCount=>50)
                 products = self.get_products_batch(
                     rule.iblock_id, rule.section_id, element_id, 50
                 )
@@ -346,27 +315,20 @@ class UnderpriceProcessor:
                 
                 batch_processed = 0
                 for product in products:
-                    # Получаем исходную цену
                     if rule.price_code_from == "P":
-                        # Закупочная цена
                         source_price = self.get_purchasing_price(product.id)
                     else:
-                        # Цена из группы
                         source_price = self.get_product_price(product.id, price_from_id)
                     
                     if source_price is None or source_price <= 0:
                         continue
                     
-                    # Рассчитываем новую цену (как в PHP: price + (price * percent / 100))
                     new_price = source_price + (source_price * rule.percent / 100)
                     
                     if new_price > 0:
-                        # Обновляем цену
                         if rule.price_code_to == "P":
-                            # Обновляем закупочную цену
                             success = self.update_purchasing_price(product.id, new_price)
                         else:
-                            # Обновляем цену в группе
                             success = self.update_product_price(product.id, price_to_id, new_price)
                         
                         if success:
@@ -375,11 +337,10 @@ class UnderpriceProcessor:
                     
                     rule_processed += 1
                     batch_processed += 1
-                    element_id = product.id  # Запоминаем последний ID
+                    element_id = product.id
                 
                 self.processed_count += batch_processed
                 
-                # Если обработали меньше 50, значит это последний пакет
                 if batch_processed < 50:
                     break
                 
@@ -393,7 +354,6 @@ class UnderpriceProcessor:
     
     def get_products_batch(self, iblock_id: int, section_id: Optional[int], 
                           min_id: int, limit: int) -> List[ProductInfo]:
-        """Получение пакета товаров (аналог PHP логики)"""
         cursor = self.connection.cursor(dictionary=True)
         
         where_conditions = [
@@ -407,7 +367,6 @@ class UnderpriceProcessor:
             where_conditions.append("e.IBLOCK_SECTION_ID = %s")
             params.append(section_id)
         
-        # Добавляем условие наличия закупочной цены (как в PHP)
         where_conditions.append("cat.PURCHASING_PRICE IS NOT NULL")
         
         query = f"""
@@ -448,7 +407,6 @@ class UnderpriceProcessor:
         return products
     
     def get_purchasing_price(self, product_id: int) -> Optional[float]:
-        """Получение закупочной цены товара"""
         cursor = self.connection.cursor(dictionary=True)
         cursor.execute("""
         SELECT PURCHASING_PRICE FROM b_catalog_product 
@@ -461,7 +419,6 @@ class UnderpriceProcessor:
         return float(row['PURCHASING_PRICE']) if row and row['PURCHASING_PRICE'] else None
     
     def update_purchasing_price(self, product_id: int, new_price: float) -> bool:
-        """Обновление закупочной цены товара"""
         cursor = self.connection.cursor()
         
         try:
@@ -480,8 +437,6 @@ class UnderpriceProcessor:
             cursor.close()
 
 def main():
-    """Главная функция"""
-    # Настройка логирования
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
