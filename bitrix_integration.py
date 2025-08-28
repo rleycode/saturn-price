@@ -66,16 +66,28 @@ class BitrixClient:
     def connect(self):
         """Подключение к MySQL Bitrix"""
         try:
-            self.connection = mysql.connector.connect(
-                host=self.config.mysql_host,
-                port=self.config.mysql_port,
-                database=self.config.mysql_database,
-                user=self.config.mysql_username,
-                password=self.config.mysql_password,
-                charset='utf8mb4',
-                use_unicode=True
-            )
-            logger.info("Подключение к Bitrix MySQL установлено")
+            # Принудительно используем IPv4 для избежания проблем с ::1
+            connection_config = {
+                'host': self.config.mysql_host,
+                'port': self.config.mysql_port,
+                'database': self.config.mysql_database,
+                'user': self.config.mysql_username,
+                'password': self.config.mysql_password,
+                'charset': 'utf8mb4',
+                'use_unicode': True,
+                'autocommit': True,
+                # Принудительно используем только IPv4
+                'force_ipv6': False,
+                'use_pure': True  # Использовать чистый Python коннектор
+            }
+            
+            # Если host localhost, принудительно используем 127.0.0.1
+            if self.config.mysql_host.lower() in ['localhost', '::1']:
+                connection_config['host'] = '127.0.0.1'
+                logger.debug("Принудительно используем IPv4 (127.0.0.1) вместо localhost")
+            
+            self.connection = mysql.connector.connect(**connection_config)
+            logger.info(f"Подключение к Bitrix MySQL установлено: {connection_config['host']}:{self.config.mysql_port}")
             return True
         except Error as e:
             logger.error(f"Ошибка подключения к MySQL: {e}")
@@ -101,6 +113,25 @@ class BitrixClient:
         
         cursor = self.connection.cursor(dictionary=True)
         
+        # Сначала проверим, какие поля артикулов используются
+        check_query = """
+        SELECT DISTINCT p.CODE, COUNT(*) as count
+        FROM b_iblock_property p
+        WHERE p.IBLOCK_ID = %s 
+        AND p.CODE IN ('CML2_ARTICLE', 'CML2_TRAIT_ARTIKUL', 'ARTICLE', 'SKU')
+        GROUP BY p.CODE
+        ORDER BY count DESC
+        """
+        
+        cursor.execute(check_query, (self.config.iblock_id,))
+        article_fields = cursor.fetchall()
+        
+        # Выбираем наиболее подходящее поле для артикулов
+        article_field = 'CML2_ARTICLE'  # по умолчанию
+        if article_fields:
+            article_field = article_fields[0]['CODE']
+            logger.info(f"Используем поле артикула: {article_field}")
+        
         query = """
         SELECT 
             e.ID,
@@ -113,7 +144,7 @@ class BitrixClient:
             e.ID = p.IBLOCK_ELEMENT_ID 
             AND p.IBLOCK_PROPERTY_ID = (
                 SELECT ID FROM b_iblock_property 
-                WHERE IBLOCK_ID = %s AND CODE = 'CML2_ARTICLE'
+                WHERE IBLOCK_ID = %s AND CODE = %s
             )
         )
         WHERE e.IBLOCK_ID = %s 
@@ -124,6 +155,7 @@ class BitrixClient:
         
         cursor.execute(query, (
             self.config.iblock_id,
+            article_field,
             self.config.iblock_id,
             f"{self.config.supplier_prefix}%"
         ))
