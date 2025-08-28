@@ -300,36 +300,64 @@ class BitrixClient:
             
             if existing_price:
                 # Обновляем существующую цену
-                cursor.execute("""
+                update_query = """
                 UPDATE b_catalog_price 
                 SET PRICE = %s, TIMESTAMP_X = NOW()
                 WHERE PRODUCT_ID = %s AND CATALOG_GROUP_ID = %s
-                """, (price, product_id, price_type_id))
+                """
+                cursor.execute(update_query, (price, product_id, price_type_id))
+                logger.debug(f"Обновлена цена для товара {product_id}: {price} руб.")
             else:
                 # Создаем новую цену
-                cursor.execute("""
+                insert_query = """
                 INSERT INTO b_catalog_price 
                 (PRODUCT_ID, CATALOG_GROUP_ID, PRICE, CURRENCY, TIMESTAMP_X)
                 VALUES (%s, %s, %s, 'RUB', NOW())
-                """, (product_id, price_type_id, price))
+                """
+                cursor.execute(insert_query, (product_id, price_type_id, price))
+                logger.debug(f"Создана новая цена для товара {product_id}: {price} руб.")
             
-            self.connection.commit()
+            # autocommit=True уже установлен, commit() не нужен
             return True
             
         except Error as e:
             logger.error(f"Ошибка обновления цены для товара {product_id}: {e}")
-            self.connection.rollback()
+            logger.error(f"SQL ошибка: {e}")
             return False
         finally:
             cursor.close()
     
     def trigger_underprice_module(self) -> bool:
         """Запуск модуля underprice для пересчета скидок"""
+        try:
+            # Используем новый Python модуль underprice вместо HTTP запроса
+            from underprice_python import UnderpriceProcessor
+            
+            logger.info("Запускаем Python модуль underprice...")
+            processor = UnderpriceProcessor()
+            processor.connect()
+            processor.process_underprice_rules()
+            processor.disconnect()
+            
+            logger.info("Модуль underprice успешно выполнен")
+            return True
+            
+        except ImportError:
+            # Fallback на старый HTTP метод если новый модуль недоступен
+            logger.warning("Python модуль underprice недоступен, используем HTTP метод")
+            return self._trigger_underprice_http()
+        except Exception as e:
+            logger.error(f"Ошибка выполнения underprice: {e}")
+            return False
+    
+    def _trigger_underprice_http(self) -> bool:
+        """Запуск underprice через HTTP (fallback метод)"""
         if not self.config.underprice_url or not self.config.underprice_password:
             logger.info("Настройки underprice не заданы, пропускаем")
             return True
         
         try:
+            import requests
             response = requests.post(
                 self.config.underprice_url,
                 data={'password': self.config.underprice_password},
@@ -343,7 +371,7 @@ class BitrixClient:
                 logger.error(f"Ошибка запуска underprice: HTTP {response.status_code}")
                 return False
                 
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             logger.error(f"Ошибка запроса к underprice: {e}")
             return False
 

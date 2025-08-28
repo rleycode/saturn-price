@@ -11,6 +11,10 @@ from pathlib import Path
 from datetime import datetime
 import logging
 from typing import List, Optional
+from dotenv import load_dotenv
+
+# Загружаем переменные окружения из .env
+load_dotenv()
 
 # Импорт наших модулей
 from saturn_parser import SaturnParser, ProcessLock, load_skus_from_file
@@ -46,7 +50,7 @@ class FullSyncManager:
                 mysql_username=os.getenv('BITRIX_MYSQL_USERNAME', 'bitrix_sync'),
                 mysql_password=os.getenv('BITRIX_MYSQL_PASSWORD', ''),
                 iblock_id=int(os.getenv('BITRIX_IBLOCK_ID', 11)),
-                supplier_prefix=os.getenv('SUPPLIER_PREFIX', 'saturn-'),
+                supplier_prefix=os.getenv('SUPPLIER_PREFIX', 'тов-'),
                 underprice_url=os.getenv('SATURN_UNDERPRICE_URL'),
                 underprice_password=os.getenv('SATURN_UNDERPRICE_PASSWORD')
             )

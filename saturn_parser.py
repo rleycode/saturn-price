@@ -17,15 +17,20 @@ from dataclasses import dataclass, asdict
 from urllib.parse import urljoin, quote_plus
 import logging
 from logging.handlers import RotatingFileHandler
+from bs4 import BeautifulSoup
 
 # Настройка логирования
 def setup_logging():
     """Настройка логирования с ротацией файлов"""
+    logger = logging.getLogger(__name__)
+    
+    # Проверяем, есть ли уже обработчики
+    if logger.handlers:
+        return logger
+    
+    logger.setLevel(logging.INFO)
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    
-    logger = logging.getLogger(__name__)
-    logger.setLevel(logging.INFO)
     
     # Ротация логов (максимум 2 файла по 10MB)
     handler = RotatingFileHandler(
@@ -181,9 +186,10 @@ class SaturnParser:
                     return name
         return None
     
-    def _search_product_url(self, sku: str) -> Optional[str]:
-        """Поиск URL товара по артикулу"""
+    def _search_product_data(self, sku: str) -> Optional[dict]:
+        """Поиск данных товара по артикулу на странице результатов"""
         search_queries = [
+            f"тов-{sku}",  # Полный артикул с префиксом
             sku,
             sku.replace('-', ''),
             sku.replace('_', ''),
@@ -192,26 +198,142 @@ class SaturnParser:
         ]
         
         for query in search_queries:
-            search_url = f"{self.base_url}/search/?q={quote_plus(query)}"
+            search_url = f"{self.base_url}/catalog/?sp%5Bname%5D=1&sp%5Bartikul%5D=1&search=&s={query}"
             response = self._make_request(search_url)
             
             if not response:
                 continue
             
-            # Поиск ссылок на товары в результатах поиска
-            product_links = re.findall(
-                r'<a[^>]*href="([^"]*(?:product|item|goods)[^"]*)"[^>]*>',
-                response.text,
-                re.IGNORECASE
-            )
+            # Используем BeautifulSoup для более точного парсинга
+            soup = BeautifulSoup(response.text, 'html.parser')
             
-            for link in product_links:
-                if link.startswith('/'):
-                    link = urljoin(self.base_url, link)
+            # Проверяем, что найден конкретный товар (не страница каталога)
+            page_text = soup.get_text()
+            
+            # Если это страница каталога, ищем прямую ссылку на товар
+            if "найдено:" in page_text.lower() and "товар" in page_text.lower():
+                logger.info(f"Найдена страница результатов поиска для {sku}")
                 
-                # Проверяем, что ссылка содержит артикул
-                if any(q.lower() in link.lower() for q in [sku, sku.replace('-', '')]):
-                    return link
+                # Ищем ссылки на конкретные товары
+                product_links = soup.find_all('a', href=re.compile(r'/catalog/[^/]+/[^/]+/$'))
+                
+                for link in product_links:
+                    link_text = link.get_text(strip=True).lower()
+                    href = link.get('href')
+                    
+                    # Проверяем, содержит ли ссылка наш артикул или подходящие ключевые слова
+                    if (sku in link_text or 
+                        f"тов-{sku}" in link_text or
+                        any(keyword in link_text for keyword in ["брусок", "строганый", "сухой"])):
+                        
+                        # Переходим на страницу товара
+                        if not href.startswith('http'):
+                            product_url = urljoin(self.base_url, href)
+                        else:
+                            product_url = href
+                        
+                        logger.info(f"Найдена ссылка на товар: {product_url}")
+                        
+                        # Загружаем страницу товара
+                        product_response = self._make_request(product_url)
+                        if not product_response:
+                            continue
+                        
+                        product_soup = BeautifulSoup(product_response.text, 'html.parser')
+                        
+                        # Ищем цены на странице товара
+                        price_elements = product_soup.find_all(attrs={'data-price': True})
+                        
+                        if price_elements:
+                            try:
+                                # Берем первую найденную цену
+                                price_value = price_elements[0].get('data-price')
+                                price = float(price_value)
+                                
+                                # Ищем название товара
+                                name = None
+                                
+                                # Поиск в заголовках
+                                for tag in ['h1', 'h2', 'title']:
+                                    title_elem = product_soup.find(tag)
+                                    if title_elem:
+                                        name = title_elem.get_text(strip=True)
+                                        if len(name) > 10:  # Фильтруем короткие названия
+                                            break
+                                
+                                if not name:
+                                    name = link.get_text(strip=True)
+                                
+                                logger.info(f"Найден товар {sku}: {name} - {price}₽")
+                                
+                                return ProductPrice(
+                                    sku=sku,
+                                    name=name,
+                                    price=price,
+                                    old_price=None,
+                                    url=product_url,
+                                    timestamp=datetime.now()
+                                )
+                                
+                            except (ValueError, TypeError) as e:
+                                logger.warning(f"Ошибка парсинга цены для {sku}: {e}")
+                                continue
+            
+            # Если не нашли на странице результатов, пробуем старую логику
+            sku_with_prefix = f"тов-{sku}"
+            elements_with_sku = soup.find_all(string=re.compile(re.escape(sku_with_prefix)))
+            
+            if not elements_with_sku:
+                elements_with_sku = soup.find_all(string=re.compile(re.escape(sku)))
+            
+            for sku_element in elements_with_sku:
+                current = sku_element.parent
+                for _ in range(10):
+                    if not current:
+                        break
+                    
+                    price_elements = current.find_all(attrs={'data-price': True})
+                    if price_elements:
+                        try:
+                            price_value = price_elements[0].get('data-price')
+                            price = float(price_value)
+                            
+                            text_content = current.get_text()
+                            sku_pos = text_content.find(sku_with_prefix)
+                            if sku_pos == -1:
+                                sku_pos = text_content.find(sku)
+                            
+                            name = None  # Инициализируем переменную
+                            
+                            if sku_pos != -1:
+                                start = max(0, sku_pos - 100)
+                                end = min(len(text_content), sku_pos + 200)
+                                context = text_content[start:end]
+                                
+                                # Ищем название в контексте
+                                lines = context.split('\n')
+                                for line in lines:
+                                    line = line.strip()
+                                    if len(line) > 10 and sku not in line and 'руб' not in line.lower():
+                                        # Это может быть название товара
+                                        if any(word in line.lower() for word in ['брусок', 'доска', 'рейка', 'балка']):
+                                            name = line
+                                            break
+                            
+                            if not name:
+                                name = f"Товар {sku}"
+                            
+                            return {
+                                'name': name,
+                                'price': price,
+                                'availability': 'Да',
+                                'url': search_url
+                            }
+                            
+                        except (ValueError, TypeError):
+                            continue
+                    
+                    current = current.parent
         
         return None
     
@@ -219,57 +341,19 @@ class SaturnParser:
         """Парсинг товара по артикулу"""
         logger.info(f"Парсинг товара: {sku}")
         
-        # Поиск URL товара
-        product_url = self._search_product_url(sku)
-        if not product_url:
+        # Поиск данных товара на странице результатов
+        product_data = self._search_product_data(sku)
+        if not product_data:
             logger.warning(f"Товар не найден: {sku}")
             return None
         
-        # Получение страницы товара
-        response = self._make_request(product_url)
-        if not response:
-            logger.error(f"Не удалось загрузить страницу: {product_url}")
-            return None
-        
-        # Извлечение данных
-        name = self._extract_name(response.text)
-        price = self._extract_price(response.text)
-        
-        if not price:
-            logger.warning(f"Цена не найдена для {sku}")
-            return None
-        
-        if not name:
-            name = f"Товар {sku}"
-        
-        # Определение доступности
-        availability = "Да"
-        if any(phrase in response.text.lower() for phrase in ['нет в наличии', 'отсутствует', 'под заказ']):
-            availability = "Нет"
-        
-        # Поиск старой цены (если есть)
-        old_price = None
-        old_price_patterns = [
-            r'<span[^>]*class="[^"]*old[^"]*price[^"]*"[^>]*>([0-9\s,\.]+)',
-            r'"old_price":\s*"?([0-9\s,\.]+)"?',
-        ]
-        
-        for pattern in old_price_patterns:
-            matches = re.findall(pattern, response.text, re.IGNORECASE)
-            if matches:
-                try:
-                    old_price = float(matches[0].replace(' ', '').replace(',', '.'))
-                    break
-                except ValueError:
-                    continue
-        
         return ProductPrice(
             sku=sku,
-            name=name,
-            price=price,
-            old_price=old_price,
-            availability=availability,
-            url=product_url,
+            name=product_data['name'],
+            price=product_data['price'],
+            old_price=None,
+            availability=product_data['availability'],
+            url=product_data['url'],
             parsed_at=datetime.now()
         )
     
