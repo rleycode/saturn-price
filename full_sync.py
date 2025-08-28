@@ -59,8 +59,14 @@ class FullSyncManager:
         """Получение списка артикулов Saturn из Bitrix"""
         logger.info("Получение списка артикулов Saturn из Bitrix...")
         
-        with BitrixClient(self.config) as bitrix:
-            products = bitrix.get_products_by_prefix()
+        # Создаем отдельное подключение для получения SKU
+        bitrix_client = BitrixClient(self.config)
+        try:
+            if not bitrix_client.connect():
+                logger.error("Не удалось подключиться к Bitrix")
+                return []
+            
+            products = bitrix_client.get_products_by_prefix()
             
             # Извлекаем артикулы без префикса
             skus = []
@@ -70,6 +76,10 @@ class FullSyncManager:
             
             logger.info(f"Найдено артикулов Saturn: {len(skus)}")
             return skus
+            
+        finally:
+            # Явно закрываем соединение после получения SKU
+            bitrix_client.disconnect()
     
     def stage1_parse_prices(self, skus: List[str] = None, batch_size: int = None) -> bool:
         """Этап 1: Парсинг цен с Saturn"""
