@@ -25,11 +25,12 @@ class ProductPrice:
     availability: str
     url: str
     old_price: Optional[float] = None
+    parsed_at: Optional[datetime] = None
 
 class FastSaturnParser:
     
     def __init__(self, max_workers: int = 10, request_delay: float = 0.1):
-        self.base_url = "https://nnv.saturn.net"
+        self.base_url = "https://msk.saturn.net"
         self.search_url = f"{self.base_url}/catalog/?sp%5Bname%5D=1&sp%5Bartikul%5D=1&search=&s="
         self.max_workers = max_workers
         self.request_delay = request_delay
@@ -51,47 +52,143 @@ class FastSaturnParser:
     
     def parse_single_product(self, sku: str) -> Optional[ProductPrice]:
         try:
+            # Сначала пробуем прямой поиск на странице поиска
             url = f"{self.search_url}{sku}"
-            
             response = self.session.get(url, timeout=10)
             response.raise_for_status()
-            
             soup = BeautifulSoup(response.content, 'html.parser')
             
-            product_items = soup.find_all('div', class_='catalog-item')
-            
+            # Метод 1: Прямой поиск в контейнерах товаров
+            product_items = soup.find_all('div', class_='h_s_list_categor_item_wrap')
             for item in product_items:
-                article_elem = item.find('span', class_='article')
+                article_elem = item.find('p', class_='h_s_list_categor_item_articul')
                 if not article_elem:
                     continue
                 
                 article_text = article_elem.get_text(strip=True)
-                if sku not in article_text:
+                expected_article = f"тов-{sku}"
+                if expected_article not in article_text:
                     continue
                 
-                name_elem = item.find('a', class_='name')
+                name_elem = item.find('p', class_='h_s_list_categor_item_txt')
                 name = name_elem.get_text(strip=True) if name_elem else f"Товар {sku}"
                 
-                price_elem = item.find('span', {'data-price': True})
-                if not price_elem:
-                    continue
+                price_elem = item.find('span', class_='js-price-value')
+                if price_elem and price_elem.get('data-price'):
+                    try:
+                        price = float(price_elem.get('data-price'))
+                        return ProductPrice(
+                            sku=sku,
+                            name=name,
+                            price=price,
+                            old_price=None,
+                            availability="В наличии",
+                            url=url,
+                            parsed_at=datetime.now()
+                        )
+                    except ValueError:
+                        continue
+            
+            # Метод 2: Поиск по ссылкам на товары (как в saturn_parser.py)
+            page_text = soup.get_text()
+            if "найдено:" in page_text.lower() and "товар" in page_text.lower():
+                import re
+                from urllib.parse import urljoin
                 
-                try:
-                    price = float(price_elem['data-price'])
-                except (ValueError, KeyError):
-                    continue
+                product_links = soup.find_all('a', href=re.compile(r'/catalog/[^/]+/[^/]+/$'))
                 
-                availability = "В наличии"
-                if item.find('span', class_='not-available'):
-                    availability = "Нет в наличии"
-                
-                return ProductPrice(
-                    sku=sku,
-                    name=name,
-                    price=price,
-                    availability=availability,
-                    url=url
-                )
+                for link in product_links:
+                    link_text = link.get_text(strip=True).lower()
+                    href = link.get('href')
+                    
+                    if (sku in link_text or 
+                        f"тов-{sku}" in link_text):
+                        
+                        if not href.startswith('http'):
+                            product_url = urljoin("https://msk.saturn.net", href)
+                        else:
+                            product_url = href
+                        
+                        # Переходим на страницу товара
+                        product_response = self.session.get(product_url, timeout=10)
+                        if product_response.status_code != 200:
+                            continue
+                        
+                        product_soup = BeautifulSoup(product_response.content, 'html.parser')
+                        
+                        # КРИТИЧЕСКИ ВАЖНО: Проверяем что артикул действительно есть на странице товара
+                        page_content = product_soup.get_text()
+                        expected_article = f"тов-{sku}"
+                        if expected_article not in page_content:
+                            # Товар не подтвержден - пропускаем
+                            continue
+                        
+                        price_elements = product_soup.find_all(attrs={'data-price': True})
+                        
+                        if price_elements:
+                            try:
+                                price_value = price_elements[0].get('data-price')
+                                price = float(price_value)
+                                
+                                # Ищем название товара
+                                name = None
+                                for tag in ['h1', 'h2', 'title']:
+                                    title_elem = product_soup.find(tag)
+                                    if title_elem:
+                                        name = title_elem.get_text(strip=True)
+                                        if len(name) > 10:
+                                            break
+                                
+                                if not name:
+                                    name = link.get_text(strip=True)
+                                
+                                return ProductPrice(
+                                    sku=sku,
+                                    name=name,
+                                    price=price,
+                                    old_price=None,
+                                    availability="В наличии",
+                                    url=product_url,
+                                    parsed_at=datetime.now()
+                                )
+                                
+                            except (ValueError, TypeError):
+                                continue
+            
+            # Метод 3: Поиск по тексту страницы (fallback)
+            # Может найти неточные совпадения, но лучше что-то, чем ничего
+            import re
+            sku_with_prefix = f"тов-{sku}"
+            elements_with_sku = soup.find_all(string=re.compile(re.escape(sku_with_prefix)))
+            
+            if not elements_with_sku:
+                elements_with_sku = soup.find_all(string=re.compile(re.escape(sku)))
+            
+            for sku_element in elements_with_sku:
+                current = sku_element.parent
+                for _ in range(10):
+                    if not current:
+                        break
+                    
+                    price_elements = current.find_all(attrs={'data-price': True})
+                    if price_elements:
+                        try:
+                            price_value = price_elements[0].get('data-price')
+                            price = float(price_value)
+                            
+                            return ProductPrice(
+                                sku=sku,
+                                name=f"Товар {sku}",
+                                price=price,
+                                old_price=None,
+                                availability="В наличии",
+                                url=url,
+                                parsed_at=datetime.now()
+                            )
+                        except (ValueError, TypeError):
+                            continue
+                    
+                    current = current.parent
             
             return None
             
@@ -104,9 +201,30 @@ class FastSaturnParser:
                 self.logger.error(f"Ошибка парсинга {sku}: {e}")
             return None
     
-    def parse_products_batch(self, skus: List[str], output_file: str = None) -> List[ProductPrice]:
+    def parse_products_batch(self, skus: List[str], output_file: str = None, update_bitrix: bool = True) -> List[ProductPrice]:
         start_time = time.time()
         results = []
+        
+        # Подключение к Bitrix для обновления цен
+        bitrix_client = None
+        if update_bitrix:
+            try:
+                from bitrix_integration import BitrixClient, BitrixConfig
+                config = BitrixConfig(
+                    mysql_host=os.getenv('BITRIX_MYSQL_HOST', '127.0.0.1'),
+                    mysql_port=int(os.getenv('BITRIX_MYSQL_PORT', 3306)),
+                    mysql_database=os.getenv('BITRIX_MYSQL_DATABASE', 'sitemanager'),
+                    mysql_username=os.getenv('BITRIX_MYSQL_USERNAME', 'bitrix_sync'),
+                    mysql_password=os.getenv('BITRIX_MYSQL_PASSWORD', ''),
+                    iblock_id=int(os.getenv('BITRIX_IBLOCK_ID', 11)),
+                    supplier_prefix=os.getenv('SUPPLIER_PREFIX', 'тов-')
+                )
+                bitrix_client = BitrixClient(config)
+                bitrix_client.connect()
+                self.logger.info("Подключение к Bitrix установлено для обновления цен")
+            except Exception as e:
+                self.logger.warning(f"Не удалось подключиться к Bitrix: {e}")
+                update_bitrix = False
         
         self.logger.info(f"Начинаем быстрый парсинг {len(skus)} товаров ({self.max_workers} потоков)")
         
@@ -126,8 +244,41 @@ class FastSaturnParser:
                         results.append(result)
                         self.success_count += 1
                         
-                        with self.log_lock:
-                            self.logger.info(f"Найден {sku}: {result.price} руб.")
+                        # Обновляем цену в Bitrix напрямую с применением наценки
+                        if update_bitrix and bitrix_client:
+                            try:
+                                article_with_prefix = f"тов-{sku}"
+                                product = bitrix_client.get_product_by_article(article_with_prefix)
+                                if product:
+                                    # Применяем наценку к цене
+                                    from bitrix_integration import MarkupProcessor
+                                    markup_processor = MarkupProcessor(bitrix_client)
+                                    final_price, markup_percent = markup_processor.apply_markup(product, result.price)
+                                    
+                                    # Обновляем финальную цену с наценкой
+                                    success = bitrix_client.update_product_price(product.id, final_price)
+                                    if success:
+                                        with self.log_lock:
+                                            self.logger.info(f"✅ Обновлен {sku}: {result.price} → {final_price:.2f} руб. (+{markup_percent:.1f}%)")
+                                        
+                                        # Запускаем модуль underprice для пересчета скидок
+                                        try:
+                                            bitrix_client.trigger_underprice_module(product.id)
+                                        except Exception as underprice_error:
+                                            with self.log_lock:
+                                                self.logger.warning(f"Ошибка underprice для {sku}: {underprice_error}")
+                                    else:
+                                        with self.log_lock:
+                                            self.logger.warning(f"❌ Ошибка обновления {sku} в Bitrix")
+                                else:
+                                    with self.log_lock:
+                                        self.logger.warning(f"⚠️ Товар {sku} не найден в Bitrix")
+                            except Exception as e:
+                                with self.log_lock:
+                                    self.logger.error(f"Ошибка обновления {sku} в Bitrix: {e}")
+                        else:
+                            with self.log_lock:
+                                self.logger.info(f"Найден {sku}: {result.price} руб.")
                     else:
                         self.error_count += 1
                         with self.log_lock:
@@ -149,6 +300,14 @@ class FastSaturnParser:
                 if self.request_delay > 0:
                     time.sleep(self.request_delay)
         
+        # Закрываем подключение к Bitrix
+        if bitrix_client:
+            try:
+                bitrix_client.disconnect()
+                self.logger.info("Подключение к Bitrix закрыто")
+            except:
+                pass
+        
         if output_file and results:
             self.save_results(results, output_file)
         
@@ -158,6 +317,8 @@ class FastSaturnParser:
         self.logger.info(f"Парсинг завершен за {elapsed:.1f}с")
         self.logger.info(f"Скорость: {rate:.1f} товаров/сек")
         self.logger.info(f"Найдено: {self.success_count}/{len(skus)} товаров")
+        if update_bitrix:
+            self.logger.info(f"Цены обновлены напрямую в Bitrix")
         
         return results
     
@@ -237,7 +398,7 @@ def main():
         skus = skus[:args.batch_size]
     
     parser = FastSaturnParser(max_workers=args.workers, request_delay=args.delay)
-    results = parser.parse_products_batch(skus, args.output)
+    results = parser.parse_products_batch(skus, args.output, update_bitrix=True)
     
     return 0 if results else 1
 

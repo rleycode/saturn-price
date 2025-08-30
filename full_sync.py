@@ -62,6 +62,9 @@ class FullSyncManager:
             logger.info(f"Найдено артикулов Saturn: {len(skus)}")
             return skus
             
+        except Exception as e:
+            logger.error(f"Ошибка получения артикулов: {e}")
+            return []
         finally:
             bitrix_client.disconnect()
     

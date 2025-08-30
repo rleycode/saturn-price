@@ -92,7 +92,7 @@ class ProcessLock:
 class SaturnParser:
     
     def __init__(self):
-        self.base_url = "https://nnv.saturn.net"
+        self.base_url = "https://msk.saturn.net"
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
@@ -164,6 +164,50 @@ class SaturnParser:
                     return name
         return None
     
+    def _extract_product_data_from_item(self, item, sku: str) -> Optional[dict]:
+        """Извлекает данные товара из найденного элемента"""
+        try:
+            # Ищем название в ссылке товара
+            name_elem = item.find('a', class_='h_s_list_categor_item')
+            name = name_elem.get_text(strip=True) if name_elem else f"Товар {sku}"
+            
+            # Ищем цену в элементе с классом shopping_cart_goods_list_item_sum_item
+            price_elem = item.find('span', class_='shopping_cart_goods_list_item_sum_item')
+            price = None
+            
+            if price_elem:
+                price_text = price_elem.get_text(strip=True)
+                import re
+                price_match = re.search(r'(\d+[,.]?\d*)', price_text)
+                if price_match:
+                    try:
+                        price = float(price_match.group(1).replace(',', '.'))
+                    except ValueError:
+                        pass
+            
+            if not price:
+                # Альтернативный поиск цены по тексту
+                price_text = item.get_text()
+                import re
+                price_match = re.search(r'(\d+[,.]?\d*)\s*₽', price_text)
+                if price_match:
+                    try:
+                        price = float(price_match.group(1).replace(',', '.'))
+                    except ValueError:
+                        pass
+            
+            if price:
+                return {
+                    'name': name,
+                    'price': price,
+                    'availability': 'В наличии'
+                }
+            
+        except Exception as e:
+            logger.error(f"Ошибка извлечения данных товара {sku}: {e}")
+        
+        return None
+    
     def _search_product_data(self, sku: str) -> Optional[dict]:
         search_queries = [
             f"тов-{sku}",            sku,
@@ -181,6 +225,27 @@ class SaturnParser:
                 continue
             
             soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Используем новые селекторы найденные в анализе
+            product_items = soup.find_all('div', class_='h_s_list_categor_item_wrap')
+            
+            if product_items:
+                logger.info(f"Найдено {len(product_items)} товаров для {sku}")
+                
+                for item in product_items:
+                    # Ищем артикул в элементе p.h_s_list_categor_item_articul
+                    article_elem = item.find('p', class_='h_s_list_categor_item_articul')
+                    if not article_elem:
+                        continue
+                    
+                    article_text = article_elem.get_text(strip=True)
+                    # Ищем точное совпадение с префиксом "тов-"
+                    expected_article = f"тов-{sku}"
+                    if expected_article not in article_text:
+                        continue
+                    
+                    # Найден нужный товар
+                    return self._extract_product_data_from_item(item, sku)
             
             page_text = soup.get_text()
             
@@ -231,14 +296,12 @@ class SaturnParser:
                                 
                                 logger.info(f"Найден товар {sku}: {name} - {price}₽")
                                 
-                                return ProductPrice(
-                                    sku=sku,
-                                    name=name,
-                                    price=price,
-                                    old_price=None,
-                                    url=product_url,
-                                    timestamp=datetime.now()
-                                )
+                                return {
+                                    'name': name,
+                                    'price': price,
+                                    'availability': 'Да',
+                                    'url': product_url
+                                }
                                 
                             except (ValueError, TypeError) as e:
                                 logger.warning(f"Ошибка парсинга цены для {sku}: {e}")

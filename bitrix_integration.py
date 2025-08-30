@@ -142,13 +142,12 @@ class BitrixClient:
         query = """
         SELECT 
             e.ID,
-            p_name.VALUE as NAME,
+            e.NAME,
+            e.ACTIVE,
             p_article.VALUE as ARTICLE
         FROM b_iblock_element e
-        LEFT JOIN b_iblock_element_property p_name ON 
-            e.ID = p_name.IBLOCK_ELEMENT_ID AND p_name.IBLOCK_PROPERTY_ID = 85
         LEFT JOIN b_iblock_element_property p_article ON 
-            e.ID = p_article.IBLOCK_ELEMENT_ID AND p_article.IBLOCK_PROPERTY_ID = 86
+            e.ID = p_article.IBLOCK_ELEMENT_ID AND p_article.IBLOCK_PROPERTY_ID = 112
         WHERE e.IBLOCK_ID = %s 
             AND e.ACTIVE = 'Y'
             AND p_article.VALUE LIKE %s
@@ -202,7 +201,7 @@ class BitrixClient:
         SELECT p_article.VALUE as ARTICLE
         FROM b_iblock_element e
         LEFT JOIN b_iblock_element_property p_article ON 
-            e.ID = p_article.IBLOCK_ELEMENT_ID AND p_article.IBLOCK_PROPERTY_ID = 86
+            e.ID = p_article.IBLOCK_ELEMENT_ID AND p_article.IBLOCK_PROPERTY_ID = 112
         WHERE e.ID = %s
         """
         
@@ -400,19 +399,27 @@ class MarkupProcessor:
     
     def apply_markup(self, product: BitrixProduct, original_price: float) -> Tuple[float, float]:
         """Применение наценки к цене товара"""
+        # Ищем правило наценки в инфоблоке Bitrix
         markup_rule = self.bitrix_client.get_markup_rule_for_product(product.id)
         
         if markup_rule:
             markup_percent = markup_rule['markup_percent']
             final_price = original_price * (1 + markup_percent / 100)
-            logger.debug(f"Товар {product.article}: {original_price} → {final_price:.2f} (+{markup_percent}%)")
+            logger.debug(f"Товар {product.article}: {original_price} → {final_price:.2f} ({markup_percent:+.1f}%)")
             return final_price, markup_percent
         else:
-            # Базовая наценка по умолчанию
-            default_markup = 30.0
-            final_price = original_price * (1 + default_markup / 100)
-            logger.debug(f"Товар {product.article}: {original_price} → {final_price:.2f} (+{default_markup}% по умолчанию)")
-            return final_price, default_markup
+            # Для товаров Saturn применяем скидку -10% по умолчанию
+            if product.article.startswith('тов-'):
+                saturn_markup = -10.0  # Скидка 10% для Saturn
+                final_price = original_price * (1 + saturn_markup / 100)
+                logger.debug(f"Товар Saturn {product.article}: {original_price} → {final_price:.2f} ({saturn_markup}% по умолчанию)")
+                return final_price, saturn_markup
+            else:
+                # Базовая наценка по умолчанию для других товаров
+                default_markup = 30.0
+                final_price = original_price * (1 + default_markup / 100)
+                logger.debug(f"Товар {product.article}: {original_price} → {final_price:.2f} (+{default_markup}% по умолчанию)")
+                return final_price, default_markup
 
 
 def process_saturn_prices(input_csv: str, config: BitrixConfig, output_csv: str = None) -> bool:
